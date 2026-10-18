@@ -521,6 +521,7 @@ class MineFragment : Fragment() {
             appendLine("Android：${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
             appendLine("ABI：${Build.SUPPORTED_ABIS.joinToString(", ")}")
             appendLine("官方安装接口：${if (ZybosInstaller.isAvailable(ctx)) "可用" else "不可用"}")
+            appendLine("隐藏 API 绕过：${ZybosInstaller.hiddenApiSelfTest()}")
             appendLine()
             appendLine("【用户数据】")
             appendLine("已学习天数：${userData.studyDays}")
