@@ -4,6 +4,8 @@
 
     <!-- 用于开发者页面选择 APK 后拉起系统安装器进行覆盖安装（用户需手动确认） -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- 用于下载官方最新版本 APK（安装我们的最新版本） -->
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <application
         android:name=".App"

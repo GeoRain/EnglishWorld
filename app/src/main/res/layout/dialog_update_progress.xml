@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 下载最新版本时的进度对话框 -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:paddingStart="24dp"
+    android:paddingTop="20dp"
+    android:paddingEnd="24dp"
+    android:paddingBottom="4dp">
+
+    <TextView
+        android:id="@+id/tvUpdateTitle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="正在下载最新版本"
+        android:textColor="@color/text_primary"
+        android:textSize="16sp"
+        android:textStyle="bold" />
+
+    <ProgressBar
+        android:id="@+id/pbUpdateProgress"
+        style="?android:attr/progressBarStyleHorizontal"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:indeterminate="false"
+        android:max="100"
+        android:progress="0" />
+
+    <TextView
+        android:id="@+id/tvUpdateStatus"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="10dp"
+        android:text="正在连接服务器…"
+        android:textColor="@color/text_secondary"
+        android:textSize="13sp" />
+
+</LinearLayout>

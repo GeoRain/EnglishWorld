@@ -19,8 +19,16 @@ class UserDataManager(context: Context) {
         private const val KEY_FAVORITES = "favorites"
         private const val KEY_LEARNED = "learned"
         private const val KEY_HISTORY = "history"
+        private const val KEY_UPDATE_ENTRY_UNLOCKED = "update_entry_unlocked"
         private const val MAX_HISTORY = 50
     }
+
+    // ---------- 最新版本安装入口（连点版本号 9 次解锁，与学习数据互不影响） ----------
+    var updateEntryUnlocked: Boolean
+        get() = prefs.getBoolean(KEY_UPDATE_ENTRY_UNLOCKED, false)
+        set(value) {
+            prefs.edit().putBoolean(KEY_UPDATE_ENTRY_UNLOCKED, value).apply()
+        }
 
     // ---------- 协议 ----------
     val isPrivacyAccepted: Boolean

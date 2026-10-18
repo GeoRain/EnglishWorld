@@ -4,13 +4,18 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.widget.ProgressBar
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.core.content.FileProvider
 import androidx.fragment.app.Fragment
 import com.englishworld.databinding.FragmentMineBinding
@@ -28,15 +33,31 @@ class MineFragment : Fragment() {
     private lateinit var userData: UserDataManager
     private lateinit var wordDatabase: WordDatabase
 
-    // 隐藏的开发者调试入口：连点版本号 10 次触发，无任何提示
+    // 隐藏的开发者调试入口：连点版本号触发，无任何提示
     private var versionTapCount = 0
     private var lastVersionTapTime = 0L
+
+    // 最新版本安装：下载器与忙碌标记（避免重复点击并发下载）
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var updater: UpdateManager? = null
+    private var updateBusy = false
+
+    // 等待“允许安装未知应用”权限授予后自动继续安装的 APK
+    private var pendingInstallApk: File? = null
 
     // 选择 APK 文件的启动器：选中后复制到缓存并拉起系统安装器（覆盖安装本应用）
     private val pickApkLauncher: ActivityResultLauncher<Array<String>> =
         registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
             if (uri != null) handlePickedApk(uri)
         }
+
+    private companion object {
+        /** 两次点击版本号的最大间隔，超过则重新计数 */
+        const val TAP_WINDOW_MS = 2000L
+
+        /** 解锁「安装我们的最新版本」入口所需的连点次数 */
+        const val UNLOCK_TAP_COUNT = 9
+    }
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -53,6 +74,9 @@ class MineFragment : Fragment() {
         wordDatabase = WordDatabase(requireContext())
         setupUserInfo()
         setupClickListeners()
+        // 已解锁过则直接显示安装入口
+        binding.cardUpdate.visibility =
+            if (userData.updateEntryUnlocked) View.VISIBLE else View.GONE
     }
 
     private fun setupUserInfo() {
@@ -120,18 +144,258 @@ class MineFragment : Fragment() {
             )
         }
 
-        // 隐藏入口：连续点击版本号 10 次打开开发者调试信息页（无任何提示）
+        // 解锁后的入口：下载官方最新版并通过设备官方接口安装
+        binding.cardUpdate.setOnClickListener {
+            startInstallLatest()
+        }
+
+        // 隐藏入口：连点版本号 9 次解锁「安装我们的最新版本」，第 10 次打开开发者调试信息
         binding.textVersion.setOnClickListener {
             val now = System.currentTimeMillis()
             // 两次点击间隔超过 2 秒则重新计数，避免误触
-            versionTapCount = if (now - lastVersionTapTime <= 2000L) versionTapCount + 1 else 1
+            versionTapCount = if (now - lastVersionTapTime <= TAP_WINDOW_MS) versionTapCount + 1 else 1
             lastVersionTapTime = now
-            if (versionTapCount >= 10) {
+            if (versionTapCount == UNLOCK_TAP_COUNT) {
+                unlockUpdateEntry()
+            } else if (versionTapCount > UNLOCK_TAP_COUNT) {
                 versionTapCount = 0
                 showDeveloperInfoDialog()
             }
         }
     }
+
+    // ---------------- 最新版本安装 ----------------
+
+    /** 连点 9 次版本号：解锁并显示「安装我们的最新版本」入口 */
+    private fun unlockUpdateEntry() {
+        if (!isAdded) return
+        userData.updateEntryUnlocked = true
+        if (binding.cardUpdate.visibility != View.VISIBLE) {
+            binding.cardUpdate.visibility = View.VISIBLE
+            Toast.makeText(requireContext(), "已解锁最新版本安装入口", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /** 下载官方最新版 → 校验 → 通过设备官方接口安装 */
+    private fun startInstallLatest() {
+        if (!isAdded || updateBusy) return
+        val ctx = requireContext()
+        val appContext = ctx.applicationContext
+        updateBusy = true
+
+        val content = LayoutInflater.from(ctx).inflate(R.layout.dialog_update_progress, null)
+        val tvStatus = content.findViewById<TextView>(R.id.tvUpdateStatus)
+        val progressBar = content.findViewById<ProgressBar>(R.id.pbUpdateProgress)
+        tvStatus.text = "正在连接服务器…"
+        progressBar.isIndeterminate = true
+
+        val updateManager = UpdateManager(appContext)
+        updater = updateManager
+        var userCancelled = false
+
+        val dialog = MaterialAlertDialogBuilder(ctx)
+            .setView(content)
+            .setCancelable(false)
+            .setNegativeButton("取消") { _, _ ->
+                userCancelled = true
+                updateBusy = false
+                updateManager.cancel()
+            }
+            .show()
+
+        Thread {
+            updateManager.downloadLatest(object : UpdateManager.DownloadCallback {
+                override fun onProgress(downloaded: Long, total: Long) {
+                    mainHandler.post {
+                        if (userCancelled) return@post
+                        if (total > 0L) {
+                            progressBar.isIndeterminate = false
+                            val percent = ((downloaded * 100) / total).toInt().coerceIn(0, 100)
+                            progressBar.progress = percent
+                            tvStatus.text =
+                                "${formatSize(downloaded)} / ${formatSize(total)} · $percent%"
+                        } else {
+                            progressBar.isIndeterminate = true
+                            tvStatus.text = "已下载 ${formatSize(downloaded)}"
+                        }
+                    }
+                }
+
+                override fun onSuccess(apk: File, verification: UpdateManager.VerifyResult) {
+                    mainHandler.post {
+                        dismissQuietly(dialog)
+                        updateBusy = false
+                        if (!isAdded || userCancelled) return@post
+                        when (verification) {
+                            is UpdateManager.VerifyResult.SignatureMismatch ->
+                                showSignatureMismatch(apk, verification.reason)
+
+                            is UpdateManager.VerifyResult.DifferentPackage ->
+                                showDifferentPackage(
+                                    apk,
+                                    verification.packageName,
+                                    verification.versionName
+                                )
+
+                            else -> installLatestApk(apk, requireContext().packageName)
+                        }
+                    }
+                }
+
+                override fun onFailure(message: String) {
+                    mainHandler.post {
+                        dismissQuietly(dialog)
+                        updateBusy = false
+                        if (!isAdded || userCancelled) return@post
+                        MaterialAlertDialogBuilder(requireContext())
+                            .setTitle("下载失败")
+                            .setMessage(message)
+                            .setPositiveButton("重试") { _, _ -> startInstallLatest() }
+                            .setNegativeButton("关闭", null)
+                            .show()
+                    }
+                }
+            })
+        }.start()
+    }
+
+    /** 安装已下载并校验通过的 APK：优先走设备官方接口，失败回退系统安装器 */
+    private fun installLatestApk(apk: File, targetPackage: String) {
+        if (!isAdded) return
+        val appContext = requireContext().applicationContext
+        if (!ZybosInstaller.isAvailable(appContext)) {
+            showSystemInstallerFallback(apk, "本机未提供官方安装接口（${ZybosInstaller.SERVICE_NAME} 服务不存在）")
+            return
+        }
+
+        val isSelfUpdate = targetPackage == appContext.packageName
+        val dialog = MaterialAlertDialogBuilder(requireContext())
+            .setMessage(if (isSelfUpdate) "已下载最新版本，正在通过设备官方接口安装…" else "正在通过设备官方接口安装 $targetPackage …")
+            .setCancelable(false)
+            .show()
+
+        Thread {
+            // 系统服务以 system 身份读文件，应用私有 cache 目录可能无权限，
+            // 因此优先复制到外部私有目录（/sdcard/Android/data/<包名>/files/update/）再交给服务。
+            val installFile = prepareInstallPath(appContext, apk)
+            val outcome = ZybosInstaller.silentInstall(appContext, installFile.absolutePath, targetPackage)
+            mainHandler.post {
+                dismissQuietly(dialog)
+                if (!isAdded) return@post
+                if (outcome.success) {
+                    Toast.makeText(
+                        requireContext(),
+                        if (isSelfUpdate) "安装指令已下发，本应用即将更新重启" else "安装指令已下发",
+                        Toast.LENGTH_LONG
+                    ).show()
+                } else {
+                    showSystemInstallerFallback(apk, outcome.message)
+                }
+            }
+        }.start()
+    }
+
+    /** 官方接口不可用 / 调用失败时的兜底：改用系统安装器（用户手动确认） */
+    private fun showSystemInstallerFallback(apk: File, reason: String) {
+        if (!isAdded) return
+        val ctx = requireContext()
+        MaterialAlertDialogBuilder(ctx)
+            .setTitle("官方接口不可用")
+            .setMessage("$reason\n\n可以改用系统安装器完成更新，系统会弹窗请你确认。")
+            .setPositiveButton("改用系统安装器") { _, _ ->
+                val needsPermission = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+                    !ctx.packageManager.canRequestPackageInstalls()
+                if (needsPermission) {
+                    pendingInstallApk = apk
+                    promptEnableInstallPermission()
+                } else {
+                    launchSystemInstaller(apk)
+                }
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** 下载包的签名与本机不一致：说明不是同一把私钥签出的包，需明确告知后果 */
+    private fun showSignatureMismatch(apk: File, reason: String) {
+        if (!isAdded) return
+        val ctx = requireContext()
+        MaterialAlertDialogBuilder(ctx)
+            .setTitle("安装包签名不一致")
+            .setMessage(
+                "$reason\n\n" +
+                    "覆盖安装大概率会被系统拒绝。可先卸载当前版本，再从官方地址安装新版本。"
+            )
+            .setPositiveButton("仍要尝试安装") { _, _ ->
+                installLatestApk(apk, requireContext().packageName)
+            }
+            .setNeutralButton("卸载当前版本") { _, _ ->
+                try {
+                    startActivity(Intent(Intent.ACTION_DELETE, Uri.parse("package:${ctx.packageName}")))
+                } catch (e: Exception) {
+                    Toast.makeText(ctx, "无法打开卸载界面", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** 下载到的不是本应用的安装包：明确告知包名与版本，由用户决定是否继续 */
+    private fun showDifferentPackage(apk: File, packageName: String, versionName: String) {
+        if (!isAdded) return
+        MaterialAlertDialogBuilder(requireContext())
+            .setTitle("安装包不属于本应用")
+            .setMessage(
+                "官方地址当前提供的安装包为：\n\n" +
+                    "包名：$packageName\n" +
+                    "版本：$versionName\n\n" +
+                    "与当前应用（${requireContext().packageName}）不同。如需安装它，请点击「仍然安装」。"
+            )
+            .setPositiveButton("仍然安装") { _, _ -> installLatestApk(apk, packageName) }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** 把待安装 APK 放到系统服务可读的位置，失败则退回原路径 */
+    private fun prepareInstallPath(context: android.content.Context, apk: File): File {
+        val dir = context.getExternalFilesDir("update") ?: return apk
+        return try {
+            if (!dir.exists() && !dir.mkdirs()) return apk
+            val target = File(dir, "latest.apk")
+            if (target.length() != apk.length()) {
+                apk.copyTo(target, overwrite = true)
+            }
+            target
+        } catch (e: Exception) {
+            apk
+        }
+    }
+
+    private fun dismissQuietly(dialog: AlertDialog?) {
+        try {
+            if (dialog != null && dialog.isShowing) dialog.dismiss()
+        } catch (e: Exception) {
+            // 页面已销毁时忽略
+        }
+    }
+
+    private fun formatSize(bytes: Long): String {
+        if (bytes <= 0L) return "0 B"
+        val units = arrayOf("B", "KB", "MB", "GB")
+        var value = bytes.toDouble()
+        var index = 0
+        while (value >= 1024 && index < units.lastIndex) {
+            value /= 1024
+            index++
+        }
+        return if (index == 0) {
+            "$bytes B"
+        } else {
+            String.format(Locale.getDefault(), "%.1f %s", value, units[index])
+        }
+    }
+
+    // ---------------- 设置 / 关于 / 开发者信息 ----------------
 
     private fun showSettingsDialog() {
         val options = arrayOf(
@@ -256,6 +520,7 @@ class MineFragment : Fragment() {
             appendLine("型号：${Build.MANUFACTURER} ${Build.MODEL}")
             appendLine("Android：${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
             appendLine("ABI：${Build.SUPPORTED_ABIS.joinToString(", ")}")
+            appendLine("官方安装接口：${if (ZybosInstaller.isAvailable(ctx)) "可用" else "不可用"}")
             appendLine()
             appendLine("【用户数据】")
             appendLine("已学习天数：${userData.studyDays}")
@@ -318,6 +583,7 @@ class MineFragment : Fragment() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
             && !ctx.packageManager.canRequestPackageInstalls()
         ) {
+            pendingInstallApk = apkFile
             promptEnableInstallPermission()
             return
         }
@@ -346,7 +612,7 @@ class MineFragment : Fragment() {
         val ctx = requireContext()
         MaterialAlertDialogBuilder(ctx)
             .setTitle("需要安装权限")
-            .setMessage("系统尚未允许本应用安装安装包。请在接下来的设置页开启“允许安装未知应用”，然后重新选择安装包。")
+            .setMessage("系统尚未允许本应用安装安装包。请在接下来的设置页开启“允许安装未知应用”，然后返回本页重新点击「安装我们的最新版本」。")
             .setPositiveButton("去设置") { _, _ ->
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     try {
@@ -383,7 +649,21 @@ class MineFragment : Fragment() {
         }
     }
 
+    /** 从“允许安装未知应用”设置页返回后，若已有待装 APK 且权限已授予则继续安装 */
+    override fun onResume() {
+        super.onResume()
+        val pending = pendingInstallApk ?: return
+        val granted = Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
+            requireContext().packageManager.canRequestPackageInstalls()
+        if (!granted) return
+        pendingInstallApk = null
+        launchSystemInstaller(pending)
+    }
+
     override fun onDestroyView() {
+        updater?.cancel()
+        updater = null
+        updateBusy = false
         super.onDestroyView()
         _binding = null
     }
