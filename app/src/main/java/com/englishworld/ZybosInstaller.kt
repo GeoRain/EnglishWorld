@@ -183,14 +183,15 @@ object ZybosInstaller {
         if (hiddenApiUnlocked) return true
         return try {
             val forName = Class::class.java.getDeclaredMethod("forName", String::class.java)
+            // 注意：Kotlin 不允许 Array<Class<*>>::class 这类泛型类字面量，用实例取运行时类
             val getDeclaredMethod = Class::class.java.getDeclaredMethod(
-                "getDeclaredMethod", String::class.java, Array<Class<*>>::class.java
+                "getDeclaredMethod", String::class.java, arrayOf<Class<*>>()::class.java
             )
             val vmRuntimeClass = forName.invoke(null, "dalvik.system.VMRuntime") as Class<*>
             // 第二个参数传 null 表示无参方法
             val getRuntime = getDeclaredMethod.invoke(vmRuntimeClass, "getRuntime", null) as Method
             val setExemptions = getDeclaredMethod.invoke(
-                vmRuntimeClass, "setHiddenApiExemptions", arrayOf<Class<*>>(Array<String>::class.java)
+                vmRuntimeClass, "setHiddenApiExemptions", arrayOf<Class<*>>(arrayOf<String>()::class.java)
             ) as Method
             getRuntime.isAccessible = true
             setExemptions.isAccessible = true
