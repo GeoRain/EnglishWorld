@@ -285,14 +285,12 @@ object ZybosInstaller {
 
     private class StagedFile(val file: File, private val tempCopy: File?) {
         fun cleanup() {
-            tempCopy?.let { file ->
-                try {
-                    if (file.exists() && file.delete()) {
-                        Log.i(TAG, "已清理暂存安装包：${file.absolutePath}")
-                    }
-                } catch (t: Throwable) {
-                    Log.w(TAG, "清理暂存安装包失败：${t.message}")
-                }
+            val temp = tempCopy ?: return
+            try {
+                if (temp.exists()) temp.delete()
+                Log.i(TAG, "已清理暂存安装包：${temp.absolutePath}")
+            } catch (t: Throwable) {
+                Log.w(TAG, "清理暂存安装包失败：${t.message}")
             }
         }
     }
