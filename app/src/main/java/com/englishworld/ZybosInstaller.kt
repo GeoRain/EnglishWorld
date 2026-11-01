@@ -1,13 +1,15 @@
 package com.englishworld
 
 import android.content.Context
+import android.content.pm.PackageInfo
+import android.os.Build
 import android.util.Log
 import java.io.File
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Method
 
 /**
- * 隐藏 API 反射绕过。
+ * 隐藏 API 反射绕过（文档「三级降级」中的 VMRuntime 方案）。
  *
  * Android 9 起，非 SDK（hidden）成员的反射会被系统策略拦截（NoSuchMethodException）。
  * 这里先用 dalvik.system.VMRuntime#setHiddenApiExemptions(["L"]) 解除限制，
@@ -135,16 +137,23 @@ class RestrictionBypass {
 }
 
 /**
- * ZybOS 设备官方安装接口封装，严格按官方文档的调用顺序执行：
+ * ZybOS 设备官方安装接口封装，调用顺序严格对齐《综合报告》Birchua 授权器流程：
  *
- *     val zybosService = context.getSystemService("zybos_manager")
- *     val zybosCls = Class.forName("android.os.ZybosSysApiManager")
- *     val bypass = RestrictionBypass()
- *     bypass.getDeclaredMethod(zybosCls, "setInstallPackageDisallow", Boolean::class.java)
- *         .invoke(zybosService, false)                      // 解除安装封禁
- *     bypass.getDeclaredMethod(zybosCls, "silentInstallApk",
- *         String::class.java, Boolean::class.java, String::class.java)
- *         .invoke(zybosService, apkFile.absolutePath, true, packageName)   // 静默安装
+ *     ① Hidden API 绕过（VMRuntime.setHiddenApiExemptions）
+ *     ② context.getSystemService("zybos_manager") 取 ZybosSysApiManager 实例
+ *     ③ 解析 APK 真实路径（FUSE 路径修正 /data/media/0/ → /storage/emulated/0/；
+ *        系统服务读不到的路径兜底复制到公共目录，文件名加时间戳防旧包覆盖）
+ *     ④ setInstallPackageDisallow(false)   ← 解除 PadMS 安装拦截，紧接安装调用
+ *     ⑤ silentInstallApk(apkPath, true, packageName)   ← 静默安装
+ *     ⑥ 等待验证（最多 30 秒，每 5 秒检查一次目标包是否完成安装）
+ *     ⑦ 清理临时文件（如果复制过的话）
+ *
+ * 关键约束（来自实测）：
+ * - silentInstallApk 由 UID 1000 系统服务在另一个进程读文件：
+ *   /proc/fd 与应用私有目录都读不到，公共存储目录（/storage/emulated/0/ 下）可读；
+ * - setInstallPackageDisallow(false) 后 PadMS 云控会重置拦截，必须立刻调用安装；
+ * - silentInstallApk 是耗时阻塞操作，只能在后台线程调用；
+ * - 临时文件名必须带时间戳：公共目录存在同名旧 APK 时会装到旧包。
  *
  * 任何一步失败都不会崩溃，只返回失败原因，由调用方决定是否回退到系统安装器。
  */
@@ -156,13 +165,28 @@ object ZybosInstaller {
     /** 系统定制管理类全名 */
     const val MANAGER_CLASS = "android.os.ZybosSysApiManager"
 
+    /** 公共暂存目录：系统服务（UID 1000）实测可读；Download 目录反而读不到 */
+    private const val PUBLIC_STAGE_DIR = "/storage/emulated/0/birchua_误删"
+
+    /** FUSE 内部路径前缀 → 用户空间路径前缀 */
+    private const val FUSE_PREFIX = "/data/media/0/"
+    private const val STORAGE_PREFIX = "/storage/emulated/0/"
+
+    /** 安装验证：最多等待时长与轮询间隔（文档：最多 30 秒，每 5 秒检查一次） */
+    private const val VERIFY_TIMEOUT_MS = 30_000L
+    private const val VERIFY_INTERVAL_MS = 5_000L
+
     private const val METHOD_DISALLOW = "setInstallPackageDisallow"
     private const val METHOD_INSTALL = "silentInstallApk"
 
     private const val TAG = "ZybosInstaller"
 
-    /** 安装结果：success=true 表示系统服务已接收安装请求 */
-    data class Outcome(val success: Boolean, val message: String)
+    /** 安装结果：success=系统服务已接收安装请求；verified=30 秒内确认目标包已完成安装 */
+    data class Outcome(
+        val success: Boolean,
+        val message: String,
+        val verified: Boolean = false
+    )
 
     /** 设备是否提供官方安装接口 */
     fun isAvailable(context: Context): Boolean = serviceOf(context) != null
@@ -187,9 +211,9 @@ object ZybosInstaller {
     }
 
     /**
-     * 通过官方接口静默安装指定 APK。
+     * 通过官方接口静默安装指定 APK（含路径解析、安装验证与临时文件清理）。
      *
-     * @param apkPath     待安装 APK 的绝对路径
+     * @param apkPath     待安装 APK 的绝对路径（可以是应用私有目录，内部会自动挪到公共目录）
      * @param packageName 目标包名，随安装请求一并发给系统服务
      */
     fun silentInstall(context: Context, apkPath: String, packageName: String): Outcome {
@@ -202,12 +226,23 @@ object ZybosInstaller {
             return Outcome(false, "安装包不存在或为空")
         }
 
-        return try {
-            // 2. 绕过 Hidden API 限制
+        // 2. 解析 APK 真实路径：系统服务读不到的位置自动复制到公共目录（时间戳文件名）
+        val staged = resolveServiceReadablePath(apk)
+        val installPath = staged.file.absolutePath
+        if (staged.file.absolutePath != apk.absolutePath) {
+            Log.i(TAG, "安装包已暂存到公共目录：$installPath")
+        }
+
+        try {
+            // 3. 绕过 Hidden API 限制
             val bypass = RestrictionBypass()
             val zybosCls = Class.forName(MANAGER_CLASS)
 
-            // 3. 解除安装封禁
+            // 记录安装前的版本状态，供安装验证比对
+            val beforeInfo = packageInfoOf(context, packageName)
+            val requestTime = System.currentTimeMillis()
+
+            // 4. 解除安装封禁 —— PadMS 云控会重置拦截，必须紧接安装调用，不做其它任何事
             try {
                 val disallowInstallMethod =
                     bypass.getDeclaredMethod(zybosCls, METHOD_DISALLOW, Boolean::class.java)
@@ -218,26 +253,125 @@ object ZybosInstaller {
                 Log.w(TAG, "$METHOD_DISALLOW 调用失败：${describe(t)}")
             }
 
-            // 4. 执行静默安装
+            // 5. 执行静默安装
             val installMethod = bypass.getDeclaredMethod(
                 zybosCls, METHOD_INSTALL,
                 String::class.java, Boolean::class.java, String::class.java
             )
-            val result = invokeInstall(installMethod, zybosService, apk.absolutePath, true, packageName)
+            val result = invokeInstall(installMethod, zybosService, installPath, true, packageName)
             if (result is Boolean && !result) {
                 Log.w(TAG, "$METHOD_INSTALL 返回 false")
-                Outcome(false, "系统服务拒绝了安装请求")
+                return Outcome(false, "系统服务拒绝了安装请求")
+            }
+            Log.i(TAG, "$METHOD_INSTALL 已提交：$installPath -> $packageName")
+
+            // 6. 等待验证（最多 30 秒，每 5 秒检查一次）
+            val verified = awaitInstallVerified(context, packageName, beforeInfo, requestTime)
+            return if (verified) {
+                Outcome(true, "已通过官方接口提交安装并确认完成", verified = true)
             } else {
-                Log.i(TAG, "$METHOD_INSTALL 已提交：$apkPath -> $packageName")
-                Outcome(true, "已通过官方接口提交安装")
+                Outcome(true, "已通过官方接口提交安装（${VERIFY_TIMEOUT_MS / 1000} 秒内未确认完成）")
             }
         } catch (t: Throwable) {
             Log.e(TAG, "$METHOD_INSTALL 调用失败：${describe(t)}")
-            Outcome(false, "安装调用失败：${describe(t)}")
+            return Outcome(false, "安装调用失败：${describe(t)}")
+        } finally {
+            // 7. 清理临时文件（只有复制过才存在）
+            staged.cleanup()
         }
     }
 
-    // ---------------- 内部实现 ----------------
+    // ---------------- APK 路径解析（文档 3.2 节） ----------------
+
+    private class StagedFile(val file: File, private val tempCopy: File?) {
+        fun cleanup() {
+            tempCopy?.let { file ->
+                try {
+                    if (file.exists() && file.delete()) {
+                        Log.i(TAG, "已清理暂存安装包：${file.absolutePath}")
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "清理暂存安装包失败：${t.message}")
+                }
+            }
+        }
+    }
+
+    /**
+     * 路径解析优先级：
+     * 1. FUSE 路径修正：/data/media/0/ → /storage/emulated/0/，修正后文件存在即直接使用；
+     * 2. 原路径系统服务可读（公共存储目录下）则直接使用；
+     * 3. 兜底复制到公共目录 /storage/emulated/0/birchua_误删/，文件名 apk_<时间戳>.apk。
+     */
+    private fun resolveServiceReadablePath(apk: File): StagedFile {
+        // 1. FUSE 路径修正
+        if (apk.absolutePath.startsWith(FUSE_PREFIX)) {
+            val converted = File(STORAGE_PREFIX + apk.absolutePath.removePrefix(FUSE_PREFIX))
+            if (converted.isFile && converted.length() > 0L) {
+                return StagedFile(converted, null)
+            }
+        }
+
+        // 2. 公共存储目录下的路径可直接使用（/storage/emulated/0/xxx，且不是应用专属目录）
+        val path = apk.absolutePath
+        if (path.startsWith(STORAGE_PREFIX) && !path.contains("/Android/data/")) {
+            return StagedFile(apk, null)
+        }
+
+        // 3. 兜底：复制到公共目录，时间戳文件名防同名旧包覆盖
+        val dir = File(PUBLIC_STAGE_DIR)
+        return try {
+            if (!dir.exists() && !dir.mkdirs()) throw IllegalStateException("无法创建公共暂存目录")
+            val target = File(dir, "apk_${System.currentTimeMillis()}.apk")
+            if (target.exists()) target.delete()
+            apk.copyTo(target, overwrite = true)
+            if (target.length() <= 0L) throw IllegalStateException("暂存复制结果为空")
+            StagedFile(target, target)
+        } catch (t: Throwable) {
+            Log.w(TAG, "复制到公共暂存目录失败，退回原路径：${describe(t)}")
+            StagedFile(apk, null)
+        }
+    }
+
+    // ---------------- 安装验证（文档 ⑥） ----------------
+
+    /**
+     * 轮询目标包安装状态：出现（原来没有）或 lastUpdateTime 晚于安装请求时间即视为完成。
+     * 最多等 [VERIFY_TIMEOUT_MS]，每 [VERIFY_INTERVAL_MS] 检查一次。
+     */
+    private fun awaitInstallVerified(
+        context: Context,
+        packageName: String,
+        before: PackageInfo?,
+        requestTime: Long
+    ): Boolean {
+        val deadline = System.currentTimeMillis() + VERIFY_TIMEOUT_MS
+        while (System.currentTimeMillis() <= deadline) {
+            try {
+                Thread.sleep(VERIFY_INTERVAL_MS)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return false
+            }
+            val now = packageInfoOf(context, packageName) ?: continue
+            val updated = now.lastUpdateTime >= requestTime
+            val newlyInstalled = before == null
+            if (updated || newlyInstalled) {
+                Log.i(TAG, "安装验证通过：$packageName 已更新（lastUpdateTime=$updated, 新装=$newlyInstalled）")
+                return true
+            }
+        }
+        Log.w(TAG, "${VERIFY_TIMEOUT_MS / 1000} 秒内未确认 $packageName 完成安装")
+        return false
+    }
+
+    private fun packageInfoOf(context: Context, packageName: String): PackageInfo? = try {
+        context.packageManager.getPackageInfo(packageName, 0)
+    } catch (t: Throwable) {
+        null
+    }
+
+    // ---------------- 反射调用 ----------------
 
     /**
      * 执行安装调用。

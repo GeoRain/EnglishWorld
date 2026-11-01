@@ -275,17 +275,22 @@ class MineFragment : Fragment() {
             .show()
 
         Thread {
-            // 系统服务以 system 身份读文件，应用私有 cache 目录可能无权限，
-            // 因此优先复制到外部私有目录（/sdcard/Android/data/<包名>/files/update/）再交给服务。
-            val installFile = prepareInstallPath(appContext, apk)
-            val outcome = ZybosInstaller.silentInstall(appContext, installFile.absolutePath, targetPackage)
+            // 路径解析与公共目录暂存由 ZybosInstaller 按官方文档内部处理：
+            // 系统服务（UID 1000）读不到应用私有目录，会自动复制到
+            // /storage/emulated/0/ 公共目录（时间戳文件名），安装后自动清理。
+            val outcome = ZybosInstaller.silentInstall(appContext, apk.absolutePath, targetPackage)
             mainHandler.post {
                 dismissQuietly(dialog)
                 if (!isAdded) return@post
                 if (outcome.success) {
                     Toast.makeText(
                         requireContext(),
-                        if (isSelfUpdate) "安装指令已下发，本应用即将更新重启" else "安装指令已下发",
+                        when {
+                            isSelfUpdate && outcome.verified -> "最新版本安装完成，本应用即将更新重启"
+                            isSelfUpdate -> "安装指令已下发，本应用即将更新重启"
+                            outcome.verified -> "安装完成"
+                            else -> "安装指令已下发"
+                        },
                         Toast.LENGTH_LONG
                     ).show()
                 } else {
@@ -294,7 +299,6 @@ class MineFragment : Fragment() {
             }
         }.start()
     }
-
     /** 官方接口不可用 / 调用失败时的兜底：改用系统安装器（用户手动确认） */
     private fun showSystemInstallerFallback(apk: File, reason: String) {
         if (!isAdded) return
@@ -354,21 +358,6 @@ class MineFragment : Fragment() {
             .setPositiveButton("仍然安装") { _, _ -> installLatestApk(apk, packageName) }
             .setNegativeButton("取消", null)
             .show()
-    }
-
-    /** 把待安装 APK 放到系统服务可读的位置，失败则退回原路径 */
-    private fun prepareInstallPath(context: android.content.Context, apk: File): File {
-        val dir = context.getExternalFilesDir("update") ?: return apk
-        return try {
-            if (!dir.exists() && !dir.mkdirs()) return apk
-            val target = File(dir, "latest.apk")
-            if (target.length() != apk.length()) {
-                apk.copyTo(target, overwrite = true)
-            }
-            target
-        } catch (e: Exception) {
-            apk
-        }
     }
 
     private fun dismissQuietly(dialog: AlertDialog?) {
