@@ -16,7 +16,6 @@ import android.widget.Toast
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
-import androidx.core.content.FileProvider
 import androidx.fragment.app.Fragment
 import com.englishworld.databinding.FragmentMineBinding
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
@@ -228,16 +227,29 @@ class MineFragment : Fragment() {
                         if (!isAdded || userCancelled) return@post
                         when (verification) {
                             is UpdateManager.VerifyResult.SignatureMismatch ->
-                                showSignatureMismatch(apk, verification.reason)
-
-                            is UpdateManager.VerifyResult.DifferentPackage ->
-                                showDifferentPackage(
+                                showSignatureMismatch(
                                     apk,
-                                    verification.packageName,
-                                    verification.versionName
+                                    requireContext().packageName,
+                                    verification.reason
                                 )
 
-                            else -> installLatestApk(apk, requireContext().packageName)
+                            is UpdateManager.VerifyResult.External ->
+                                showExternalPackage(
+                                    apk,
+                                    verification.packageName,
+                                    verification.versionName,
+                                    verification.installedVersionCode > 0L
+                                )
+
+                            is UpdateManager.VerifyResult.SelfUpdate ->
+                                installLatestApk(apk, requireContext().packageName)
+
+                            is UpdateManager.VerifyResult.Rejected ->
+                                Toast.makeText(
+                                    requireContext(),
+                                    verification.reason,
+                                    Toast.LENGTH_LONG
+                                ).show()
                         }
                     }
                 }
@@ -248,7 +260,7 @@ class MineFragment : Fragment() {
                         updateBusy = false
                         if (!isAdded || userCancelled) return@post
                         MaterialAlertDialogBuilder(requireContext())
-                            .setTitle("下载失败")
+                            .setTitle("无法完成更新")
                             .setMessage(message)
                             .setPositiveButton("重试") { _, _ -> startInstallLatest() }
                             .setNegativeButton("关闭", null)
@@ -259,57 +271,99 @@ class MineFragment : Fragment() {
         }.start()
     }
 
-    /** 安装已下载并校验通过的 APK：优先走设备官方接口，失败回退系统安装器 */
+    /**
+     * 安装已下载并校验通过的 APK。
+     *
+     * 通道顺序对齐 3.2.6：先探测设备官方接口（zybos_manager），可用则静默安装并验证；
+     * 被系统签名校验封禁或设备没有该接口时，明确告知原因并引导系统安装器。
+     */
     private fun installLatestApk(apk: File, targetPackage: String) {
         if (!isAdded) return
-        val appContext = requireContext().applicationContext
-        if (!ZybosInstaller.isAvailable(appContext)) {
-            showSystemInstallerFallback(apk, "本机未提供官方安装接口（${ZybosInstaller.SERVICE_NAME} 服务不存在）")
-            return
+        val ctx = requireContext()
+        val appContext = ctx.applicationContext
+        val isSelfUpdate = targetPackage == appContext.packageName
+
+        // 先做预检：签名/降级问题提前拦下，避免装到一半被系统拒绝
+        when (val check = ApkInstaller.preflight(appContext, apk, targetPackage)) {
+            is ApkInstaller.Preflight.SignatureMismatch -> {
+                showSignatureMismatch(
+                    apk,
+                    targetPackage,
+                    "本机已安装的 $targetPackage 与这个安装包不是同一把证书签出的。"
+                )
+                return
+            }
+
+            is ApkInstaller.Preflight.Downgrade -> {
+                MaterialAlertDialogBuilder(ctx)
+                    .setTitle("已阻止降级安装")
+                    .setMessage("安装包版本（${check.incoming}）低于本机已安装版本（${check.installed}）。")
+                    .setPositiveButton("关闭", null)
+                    .show()
+                return
+            }
+
+            is ApkInstaller.Preflight.Invalid -> {
+                Toast.makeText(ctx, check.reason, Toast.LENGTH_LONG).show()
+                return
+            }
+
+            is ApkInstaller.Preflight.Ready -> Unit
         }
 
-        val isSelfUpdate = targetPackage == appContext.packageName
-        val dialog = MaterialAlertDialogBuilder(requireContext())
-            .setMessage(if (isSelfUpdate) "已下载最新版本，正在通过设备官方接口安装…" else "正在通过设备官方接口安装 $targetPackage …")
+        val content = LayoutInflater.from(ctx).inflate(R.layout.dialog_update_progress, null)
+        val tvStatus = content.findViewById<TextView>(R.id.tvUpdateStatus)
+        val progressBar = content.findViewById<ProgressBar>(R.id.pbUpdateProgress)
+        progressBar.visibility = View.GONE
+        tvStatus.text = "正在检测设备官方安装接口…"
+
+        val dialog = MaterialAlertDialogBuilder(ctx)
+            .setTitle(if (isSelfUpdate) "安装新版本" else "安装 $targetPackage")
+            .setView(content)
             .setCancelable(false)
+            .setNegativeButton("取消", null)
             .show()
 
-        Thread {
-            // 路径解析与公共目录暂存由 ZybosInstaller 按官方文档内部处理：
-            // 系统服务（UID 1000）读不到应用私有目录，会自动复制到
-            // /storage/emulated/0/ 公共目录（时间戳文件名），安装后自动清理。
-            val outcome = ZybosInstaller.silentInstall(appContext, apk.absolutePath, targetPackage)
-            mainHandler.post {
+        ApkInstaller.installAsync(appContext, apk, targetPackage, object : ApkInstaller.Callback {
+            override fun onStage(stage: String) {
+                if (!isAdded) return
+                tvStatus.text = stage
+            }
+
+            override fun onResult(result: ApkInstaller.Result) {
                 dismissQuietly(dialog)
-                if (!isAdded) return@post
-                if (outcome.success) {
-                    Toast.makeText(
-                        requireContext(),
-                        when {
-                            isSelfUpdate && outcome.verified -> "最新版本安装完成，本应用即将更新重启"
-                            isSelfUpdate -> "安装指令已下发，本应用即将更新重启"
-                            outcome.verified -> "安装完成"
-                            else -> "安装指令已下发"
-                        },
-                        Toast.LENGTH_LONG
-                    ).show()
+                if (!isAdded) return
+                if (result.success) {
+                    val text = when {
+                        isSelfUpdate && result.verified -> "新版本已安装完成，本应用即将更新重启"
+                        isSelfUpdate -> "安装请求已提交，稍后会自动更新"
+                        result.verified -> "安装完成"
+                        else -> "安装请求已提交，${result.channel?.label ?: "系统"}正在处理"
+                    }
+                    Toast.makeText(requireContext(), text, Toast.LENGTH_LONG).show()
+                } else if (result.needsUserConfirm) {
+                    showSystemInstallerFallback(apk, result.message)
                 } else {
-                    showSystemInstallerFallback(apk, outcome.message)
+                    MaterialAlertDialogBuilder(requireContext())
+                        .setTitle("安装失败")
+                        .setMessage(result.message)
+                        .setPositiveButton("重试") { _, _ -> installLatestApk(apk, targetPackage) }
+                        .setNegativeButton("关闭", null)
+                        .show()
                 }
             }
-        }.start()
+        })
     }
-    /** 官方接口不可用 / 调用失败时的兜底：改用系统安装器（用户手动确认） */
+
+    /** 静默通道不可用时的兜底：改用系统安装器（用户手动确认） */
     private fun showSystemInstallerFallback(apk: File, reason: String) {
         if (!isAdded) return
         val ctx = requireContext()
         MaterialAlertDialogBuilder(ctx)
-            .setTitle("官方接口不可用")
-            .setMessage("$reason\n\n可以改用系统安装器完成更新，系统会弹窗请你确认。")
+            .setTitle("静默安装不可用")
+            .setMessage("$reason\n\n可以改用系统安装器完成安装，系统会弹窗请你确认。")
             .setPositiveButton("改用系统安装器") { _, _ ->
-                val needsPermission = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
-                    !ctx.packageManager.canRequestPackageInstalls()
-                if (needsPermission) {
+                if (!ApkInstaller.canRequestInstall(ctx)) {
                     pendingInstallApk = apk
                     promptEnableInstallPermission()
                 } else {
@@ -321,21 +375,20 @@ class MineFragment : Fragment() {
     }
 
     /** 下载包的签名与本机不一致：说明不是同一把私钥签出的包，需明确告知后果 */
-    private fun showSignatureMismatch(apk: File, reason: String) {
+    private fun showSignatureMismatch(apk: File, targetPackage: String, reason: String) {
         if (!isAdded) return
         val ctx = requireContext()
         MaterialAlertDialogBuilder(ctx)
             .setTitle("安装包签名不一致")
             .setMessage(
                 "$reason\n\n" +
-                    "覆盖安装大概率会被系统拒绝。可先卸载当前版本，再从官方地址安装新版本。"
+                    "签名不同的包无法覆盖安装，必须先卸载本机已安装的 $targetPackage，" +
+                    "再安装这个包。卸载会清除该应用的数据。"
             )
-            .setPositiveButton("仍要尝试安装") { _, _ ->
-                installLatestApk(apk, requireContext().packageName)
-            }
-            .setNeutralButton("卸载当前版本") { _, _ ->
+            .setPositiveButton("先卸载") { _, _ ->
                 try {
-                    startActivity(Intent(Intent.ACTION_DELETE, Uri.parse("package:${ctx.packageName}")))
+                    startActivity(Intent(Intent.ACTION_DELETE, Uri.parse("package:$targetPackage")))
+                    Toast.makeText(ctx, "卸载完成后请重新选择安装包", Toast.LENGTH_LONG).show()
                 } catch (e: Exception) {
                     Toast.makeText(ctx, "无法打开卸载界面", Toast.LENGTH_SHORT).show()
                 }
@@ -344,18 +397,24 @@ class MineFragment : Fragment() {
             .show()
     }
 
-    /** 下载到的不是本应用的安装包：明确告知包名与版本，由用户决定是否继续 */
-    private fun showDifferentPackage(apk: File, packageName: String, versionName: String) {
+    /** 分发地址提供的不是本应用：说明这是独立应用，确认后按普通 APK 安装 */
+    private fun showExternalPackage(
+        apk: File,
+        packageName: String,
+        versionName: String,
+        alreadyInstalled: Boolean
+    ) {
         if (!isAdded) return
         MaterialAlertDialogBuilder(requireContext())
-            .setTitle("安装包不属于本应用")
+            .setTitle("检测到独立应用安装包")
             .setMessage(
-                "官方地址当前提供的安装包为：\n\n" +
+                "下载地址当前提供的是另一个应用：\n\n" +
                     "包名：$packageName\n" +
-                    "版本：$versionName\n\n" +
-                    "与当前应用（${requireContext().packageName}）不同。如需安装它，请点击「仍然安装」。"
+                    "版本：$versionName\n" +
+                    (if (alreadyInstalled) "本机已安装该应用，将执行覆盖升级。\n\n" else "\n") +
+                    "它不是本应用（${requireContext().packageName}）。要继续安装吗？"
             )
-            .setPositiveButton("仍然安装") { _, _ -> installLatestApk(apk, packageName) }
+            .setPositiveButton("继续安装") { _, _ -> installLatestApk(apk, packageName) }
             .setNegativeButton("取消", null)
             .show()
     }
@@ -509,8 +568,10 @@ class MineFragment : Fragment() {
             appendLine("型号：${Build.MANUFACTURER} ${Build.MODEL}")
             appendLine("Android：${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
             appendLine("ABI：${Build.SUPPORTED_ABIS.joinToString(", ")}")
-            appendLine("官方安装接口：${if (ZybosInstaller.isAvailable(ctx)) "可用" else "不可用"}")
-            appendLine("隐藏 API 绕过：${ZybosInstaller.hiddenApiSelfTest()}")
+            appendLine("【安装通道】")
+            appendLine("官方安装接口：${ApkInstaller.probe(ctx).message}")
+            appendLine("隐藏 API 绕过：${HiddenApi.selfTest()}")
+            appendLine("下载地址：${UpdateManager.sources(ctx).first()}")
             appendLine()
             appendLine("【用户数据】")
             appendLine("已学习天数：${userData.studyDays}")
@@ -521,16 +582,72 @@ class MineFragment : Fragment() {
         MaterialAlertDialogBuilder(ctx)
             .setTitle("开发者调试信息")
             .setMessage(info)
-            .setPositiveButton("选择安装包更新本应用") { _, _ ->
+            .setPositiveButton("安装本地 APK") { _, _ ->
                 startPickApkForUpdate()
             }
-            .setNeutralButton("复制") { _, _ ->
-                val clipboard = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
-                    as android.content.ClipboardManager
-                clipboard.setPrimaryClip(android.content.ClipData.newPlainText("debug_info", info))
-                Toast.makeText(ctx, "已复制到剪贴板", Toast.LENGTH_SHORT).show()
+            .setNeutralButton("更多") { _, _ ->
+                showDeveloperToolsDialog(info)
             }
             .setNegativeButton("关闭", null)
+            .show()
+    }
+
+    /** 开发者工具：复制调试信息 / 修改安装包下载地址 */
+    private fun showDeveloperToolsDialog(info: String) {
+        if (!isAdded) return
+        val ctx = requireContext()
+        val options = arrayOf("复制调试信息", "设置安装包下载地址", "恢复默认下载地址")
+        MaterialAlertDialogBuilder(ctx)
+            .setTitle("开发者工具")
+            .setItems(options) { _, which ->
+                when (which) {
+                    0 -> {
+                        val clipboard = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                            as android.content.ClipboardManager
+                        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("debug_info", info))
+                        Toast.makeText(ctx, "已复制到剪贴板", Toast.LENGTH_SHORT).show()
+                    }
+
+                    1 -> promptCustomSource()
+
+                    2 -> {
+                        UpdateManager.saveCustomSource(ctx, "")
+                        Toast.makeText(ctx, "已恢复默认下载地址", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+            .setNegativeButton("关闭", null)
+            .show()
+    }
+
+    /** 自定义 APK 下载地址（留空即恢复默认） */
+    private fun promptCustomSource() {
+        if (!isAdded) return
+        val ctx = requireContext()
+        val input = android.widget.EditText(ctx).apply {
+            setText(UpdateManager.customSource(ctx))
+            hint = "https://example.com/app.apk"
+            setSingleLine()
+        }
+        val container = android.widget.FrameLayout(ctx).apply {
+            val pad = (20 * resources.displayMetrics.density).toInt()
+            setPadding(pad, pad / 2, pad, 0)
+            addView(input)
+        }
+        MaterialAlertDialogBuilder(ctx)
+            .setTitle("安装包下载地址")
+            .setView(container)
+            .setMessage("留空则使用内置默认地址。地址必须直接返回 APK 文件。")
+            .setPositiveButton("保存") { _, _ ->
+                val url = input.text.toString().trim()
+                if (url.isNotEmpty() && !url.startsWith("http://") && !url.startsWith("https://")) {
+                    Toast.makeText(ctx, "地址必须以 http:// 或 https:// 开头", Toast.LENGTH_LONG).show()
+                    return@setPositiveButton
+                }
+                UpdateManager.saveCustomSource(ctx, url)
+                Toast.makeText(ctx, if (url.isEmpty()) "已恢复默认地址" else "已保存", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("取消", null)
             .show()
     }
 
@@ -543,7 +660,7 @@ class MineFragment : Fragment() {
         }
     }
 
-    /** 处理选中的 APK：校验为本应用安装包 -> 复制到缓存 -> 拉起系统安装器 */
+    /** 处理选中的 APK：解析 → 确认 → 走统一安装通道（先官方接口，再系统安装器） */
     private fun handlePickedApk(uri: Uri) {
         val ctx = requireContext()
         // 1. 复制到应用缓存目录（SAF 的 content Uri 系统安装器通常读不了，需转成自有文件）
@@ -552,33 +669,33 @@ class MineFragment : Fragment() {
             Toast.makeText(ctx, "读取安装包失败", Toast.LENGTH_SHORT).show()
             return
         }
-        // 2. 校验包名：仅允许本应用自己的安装包（更新本应用），拒绝任意外部应用
-        val pkgName = ctx.packageManager
-            .getPackageArchiveInfo(apkFile.absolutePath, 0)?.packageName
+        // 2. 解析包名与版本
+        val info = try {
+            ctx.packageManager.getPackageArchiveInfo(apkFile.absolutePath, 0)
+        } catch (e: Exception) {
+            null
+        }
+        val pkgName = info?.packageName
         if (pkgName == null) {
             Toast.makeText(ctx, "无效的安装包（无法解析）", Toast.LENGTH_LONG).show()
             apkFile.delete()
             return
         }
-        if (pkgName != ctx.packageName) {
-            Toast.makeText(
-                ctx,
-                "这不是本应用的安装包（包名：$pkgName），仅支持更新本应用",
-                Toast.LENGTH_LONG
-            ).show()
-            apkFile.delete()
+        // 3. 本应用的包直接装；其它应用先确认（对齐 3.2.6 的「安装本地 APK」）
+        if (pkgName == ctx.packageName) {
+            installLatestApk(apkFile, pkgName)
             return
         }
-        // 3. 检查安装权限（Android 8+ 需“允许安装未知应用”），不足则引导开启
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-            && !ctx.packageManager.canRequestPackageInstalls()
-        ) {
-            pendingInstallApk = apkFile
-            promptEnableInstallPermission()
-            return
-        }
-        // 4. 拉起系统安装器（用户需在系统弹窗确认）
-        launchSystemInstaller(apkFile)
+        MaterialAlertDialogBuilder(ctx)
+            .setTitle("确认安装")
+            .setMessage(
+                "包名：$pkgName\n" +
+                    "版本：${info?.versionName ?: "-"}\n\n" +
+                    "这不是本应用（${ctx.packageName}）的安装包，安装后会出现一个新的应用。继续吗？"
+            )
+            .setPositiveButton("安装") { _, _ -> installLatestApk(apkFile, pkgName) }
+            .setNegativeButton("取消") { _, _ -> apkFile.delete() }
+            .show()
     }
 
     /** 把选中的 content Uri 复制到 cacheDir/apk/update.apk */
@@ -602,7 +719,7 @@ class MineFragment : Fragment() {
         val ctx = requireContext()
         MaterialAlertDialogBuilder(ctx)
             .setTitle("需要安装权限")
-            .setMessage("系统尚未允许本应用安装安装包。请在接下来的设置页开启“允许安装未知应用”，然后返回本页重新点击「安装我们的最新版本」。")
+            .setMessage("系统尚未允许本应用安装安装包。请在接下来的设置页开启“允许安装未知应用”，然后返回本页重新点击安装入口。")
             .setPositiveButton("去设置") { _, _ ->
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     try {
@@ -624,18 +741,8 @@ class MineFragment : Fragment() {
     /** 通过 FileProvider 生成 Uri 并拉起系统安装器 */
     private fun launchSystemInstaller(apkFile: File) {
         val ctx = requireContext()
-        try {
-            val apkUri = FileProvider.getUriForFile(
-                ctx, "${ctx.packageName}.fileprovider", apkFile
-            )
-            val intent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(apkUri, "application/vnd.android.package-archive")
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            startActivity(intent)
-        } catch (e: Exception) {
-            Toast.makeText(ctx, "无法启动安装：${e.message}", Toast.LENGTH_LONG).show()
+        if (!ApkInstaller.launchSystemInstaller(ctx, apkFile)) {
+            Toast.makeText(ctx, "无法启动系统安装器", Toast.LENGTH_LONG).show()
         }
     }
 

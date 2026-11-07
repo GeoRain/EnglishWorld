@@ -17,3 +17,7 @@ local.properties
 
 # Gradle wrapper jar is REQUIRED for CI, do not ignore
 # gradle/wrapper/gradle-wrapper.jar
+
+# 本地 CI 产物与工作区数据
+dist/
+.workbuddy/

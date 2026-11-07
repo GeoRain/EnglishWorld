@@ -34,7 +34,10 @@ EnglishWorld/
 │       │   ├── HomeFragment.kt          # 首页Fragment
 │       │   ├── SearchFragment.kt        # 查词Fragment
 │       │   ├── LearnFragment.kt         # 学习Fragment
-│       │   └── MineFragment.kt          # 我的Fragment
+│       │   ├── MineFragment.kt          # 我的Fragment（含隐藏的版本安装入口）
+│       │   ├── ApkInstaller.kt          # 安装通道编排（设备官方接口 → 系统安装器）
+│       │   ├── ZybosBridge.kt           # zybos_manager 绑定探测与静默安装
+│       │   └── UpdateManager.kt         # 新版本 APK 下载与校验
 │       └── res/
 │           ├── layout/                  # 布局文件
 │           ├── drawable/                # 图标资源

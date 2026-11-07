@@ -11,50 +11,78 @@ import java.net.URL
 import java.security.MessageDigest
 
 /**
- * 官方最新版本 APK 的下载与校验。
+ * 最新版本 APK 的下载与校验。
  *
- * 下载地址固定为官网分发地址，下载完成后依次校验：
- * 1. 文件完整可解析；
- * 2. 包名与本应用一致（不一致时交由用户确认，不静默安装）；
- * 3. 版本号不低于当前版本（阻止降级）；
- * 4. 签名证书与本应用一致（阻止被第三方重签包覆盖）。
+ * 下载源支持多个候选：先读用户自定义地址（开发者页可改），再依次尝试内置地址。
+ * 下载完成后按安装目标的类型分流校验：
+ * - 与本应用同包名 → 阻止降级 + 签名必须一致（否则覆盖安装必被系统拒绝）；
+ * - 其它包名（官方地址分发的是 JC Code V3 这类独立应用）→ 只做「已安装同包名版本不得降级」
+ *   与可解析性校验，由调用方提示用户确认后安装。
  */
 class UpdateManager(private val context: Context) {
 
     companion object {
         private const val TAG = "UpdateManager"
 
-        /** 官方最新版 APK 分发地址 */
-        const val LATEST_APK_URL = "https://app.aibangos.xyz/therr.apk"
+        /** 内置下载源，按顺序尝试 */
+        private val DEFAULT_SOURCES = listOf(
+            "https://app.aibangos.xyz/therr.apk"
+        )
+
+        /** 自定义下载源（开发者页可改），为空则用内置源 */
+        private const val PREFS = "update_prefs"
+        private const val KEY_URL = "update_apk_url"
 
         private const val CONNECT_TIMEOUT = 15_000
         private const val READ_TIMEOUT = 30_000
         private const val BUFFER_SIZE = 64 * 1024
         private const val MAX_REDIRECTS = 5
         private const val PROGRESS_INTERVAL = 120L
+
+        fun customSource(context: Context): String =
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getString(KEY_URL, "").orEmpty().trim()
+
+        fun saveCustomSource(context: Context, url: String) {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_URL, url.trim())
+                .apply()
+        }
+
+        /** 实际尝试的下载源：自定义优先，其次内置 */
+        fun sources(context: Context): List<String> {
+            val custom = customSource(context)
+            return if (custom.isEmpty()) DEFAULT_SOURCES else listOf(custom) + DEFAULT_SOURCES
+        }
     }
 
     /** 下载回调，均发生在后台线程，调用方需自行切回主线程 */
     interface DownloadCallback {
         fun onProgress(downloaded: Long, total: Long)
 
-        /** 下载完成且通过基础校验；verification 可能为 SignatureMismatch，需提示用户 */
         fun onSuccess(apk: File, verification: VerifyResult)
         fun onFailure(message: String)
     }
 
     /** 校验结果 */
     sealed class VerifyResult {
-        object Passed : VerifyResult()
+        /** 本应用的新版本 */
+        data class SelfUpdate(val versionName: String, val versionCode: Long) : VerifyResult()
 
-        /** 安装包不可用（损坏 / 无法解析 / 降级），直接拦截 */
-        data class Rejected(val reason: String) : VerifyResult()
+        /** 其它应用（官方地址分发的独立 APK），需用户确认 */
+        data class External(
+            val packageName: String,
+            val versionName: String,
+            val versionCode: Long,
+            val installedVersionCode: Long
+        ) : VerifyResult()
 
-        /** 安装包不属于本应用：需用户明确确认后才安装 */
-        data class DifferentPackage(val packageName: String, val versionName: String) : VerifyResult()
-
-        /** 与本机版本签名不一致：覆盖安装会被系统拒绝 */
+        /** 签名与本机同名应用不一致，覆盖安装会被系统拒绝 */
         data class SignatureMismatch(val reason: String) : VerifyResult()
+
+        /** 不可用（损坏 / 无法解析 / 降级） */
+        data class Rejected(val reason: String) : VerifyResult()
     }
 
     @Volatile
@@ -64,9 +92,49 @@ class UpdateManager(private val context: Context) {
         cancelled = true
     }
 
-    /** 下载最新版 APK 到 cacheDir/apk/latest.apk，成功后已完成全部校验 */
+    /** 依次尝试各下载源，第一个成功的即返回 */
     fun downloadLatest(callback: DownloadCallback) {
         cancelled = false
+        val candidates = sources(context)
+        var lastError = "没有任何可用的下载地址"
+
+        for (source in candidates) {
+            if (cancelled) {
+                callback.onFailure("已取消")
+                return
+            }
+            val apk = try {
+                downloadFrom(source, callback)
+            } catch (e: Exception) {
+                if (cancelled) {
+                    callback.onFailure("已取消")
+                    return
+                }
+                lastError = e.message ?: e.javaClass.simpleName
+                Log.w(TAG, "下载源失败 $source：$lastError")
+                null
+            } ?: continue
+
+            val result = verify(apk)
+            when (result) {
+                is VerifyResult.Rejected -> {
+                    apk.delete()
+                    lastError = result.reason
+                    Log.w(TAG, "下载包被拒绝（$source）：${result.reason}")
+                }
+
+                else -> {
+                    callback.onSuccess(apk, result)
+                    return
+                }
+            }
+        }
+
+        callback.onFailure(lastError)
+    }
+
+    /** 单个源的下载；失败直接抛异常，由上层切换下一个源 */
+    private fun downloadFrom(source: String, callback: DownloadCallback): File? {
         val dir = File(context.cacheDir, "apk").apply { mkdirs() }
         val target = File(dir, "latest.apk")
         val temp = File(dir, "latest.apk.part")
@@ -75,11 +143,8 @@ class UpdateManager(private val context: Context) {
         try {
             if (temp.exists()) temp.delete()
 
-            val conn = openFollowRedirects()
-            if (conn == null) {
-                callback.onFailure("下载地址重定向异常，无法获取安装包")
-                return
-            }
+            val conn = openFollowRedirects(source)
+                ?: throw IllegalStateException("下载地址重定向异常")
             connection = conn
             val total = conn.contentLengthLong
             conn.inputStream.use { input ->
@@ -88,10 +153,7 @@ class UpdateManager(private val context: Context) {
                     var downloaded = 0L
                     var lastReport = 0L
                     while (true) {
-                        if (cancelled) {
-                            callback.onFailure("已取消")
-                            return
-                        }
+                        if (cancelled) throw InterruptedException("已取消")
                         val read = input.read(buffer)
                         if (read <= 0) break
                         output.write(buffer, 0, read)
@@ -103,40 +165,30 @@ class UpdateManager(private val context: Context) {
                         }
                     }
                     callback.onProgress(downloaded, total)
+                    if (downloaded <= 0L) throw IllegalStateException("下载内容为空")
+                    if (total > 0L && downloaded != total) {
+                        throw IllegalStateException("下载不完整（$downloaded/$total）")
+                    }
                 }
             }
 
-            if (temp.length() <= 0L) {
-                temp.delete()
-                callback.onFailure("下载内容为空，请检查网络后重试")
-                return
-            }
             if (target.exists()) target.delete()
             if (!temp.renameTo(target)) {
                 temp.copyTo(target, overwrite = true)
                 temp.delete()
             }
-
-            val result = verify(target)
-            if (result is VerifyResult.Rejected) {
-                target.delete()
-                callback.onFailure(result.reason)
-                return
-            }
-            // Passed 与 SignatureMismatch 均交由调用方处理（后者需额外提示）
-            callback.onSuccess(target, result)
-        } catch (e: Exception) {
-            Log.e(TAG, "下载失败", e)
-            if (temp.exists()) temp.delete()
-            if (cancelled) callback.onFailure("已取消") else callback.onFailure("下载失败：${e.message ?: e.javaClass.simpleName}")
+            return target
+        } catch (e: InterruptedException) {
+            throw e
         } finally {
             connection?.disconnect()
+            if (temp.exists()) temp.delete()
         }
     }
 
     /** 手动跟随重定向（跨协议重定向时 HttpURLConnection 不会自动处理） */
-    private fun openFollowRedirects(): HttpURLConnection? {
-        var url = URL(LATEST_APK_URL)
+    private fun openFollowRedirects(source: String): HttpURLConnection? {
+        var url = URL(source)
         var redirects = 0
         while (redirects <= MAX_REDIRECTS) {
             val connection = (url.openConnection() as HttpURLConnection).apply {
@@ -171,6 +223,10 @@ class UpdateManager(private val context: Context) {
         if (!apk.isFile || apk.length() < 1024L) {
             return VerifyResult.Rejected("安装包无效（文件过小），可能下载不完整")
         }
+        if (!looksLikeZip(apk)) {
+            return VerifyResult.Rejected("下载到的不是 APK（可能是网页或错误页）")
+        }
+
         val flags = packageFlags()
         val archive = try {
             context.packageManager.getPackageArchiveInfo(apk.absolutePath, flags)
@@ -179,25 +235,41 @@ class UpdateManager(private val context: Context) {
             null
         } ?: return VerifyResult.Rejected("安装包无法解析，可能下载不完整")
 
-        if (archive.packageName != context.packageName) {
-            // 不是本应用的包：交给用户确认（官方分发地址可能指向其它产品）
-            return VerifyResult.DifferentPackage(
-                archive.packageName ?: "-",
-                archive.versionName ?: "-"
-            )
+        val newPackage = archive.packageName ?: return VerifyResult.Rejected("安装包缺少包名")
+        val newCode = versionCodeOf(archive)
+        val newName = archive.versionName ?: "-"
+
+        // 不是本应用：走「外部应用安装」校验（官方地址可能分发其它产品）
+        if (newPackage != context.packageName) {
+            val installed = installedInfo(newPackage)
+            val installedCode = installed?.let { versionCodeOf(it) } ?: 0L
+            if (installedCode > 0L && newCode < installedCode) {
+                return VerifyResult.Rejected(
+                    "服务器上的 $newPackage（$newCode）低于本机已安装的 $installedCode，已阻止降级"
+                )
+            }
+            // 已装同名应用时签名必须一致，否则覆盖安装必被系统拒绝
+            if (installed != null) {
+                val oldDigest = signatureDigest(installed)
+                val newDigest = signatureDigest(archive)
+                if (oldDigest != null && newDigest != null && !oldDigest.contentEquals(newDigest)) {
+                    return VerifyResult.Rejected(
+                        "下载的 $newPackage 与本机已安装版本签名不一致，无法覆盖安装"
+                    )
+                }
+            }
+            return VerifyResult.External(newPackage, newName, newCode, installedCode)
         }
 
-        val installed = try {
-            context.packageManager.getPackageInfo(context.packageName, flags)
-        } catch (e: Exception) {
-            Log.w(TAG, "读取本机版本信息失败", e)
-            null
-        } ?: return VerifyResult.Rejected("无法读取本机版本信息")
+        // 本应用：阻止降级 + 签名一致
+        val installed = installedInfo(context.packageName)
+            ?: return VerifyResult.Rejected("无法读取本机版本信息")
 
-        val newCode = versionCodeOf(archive)
-        val oldCode = versionCodeOf(installed)
-        if (newCode < oldCode) {
-            return VerifyResult.Rejected("服务器上的版本（$newCode）低于当前版本（$oldCode），已阻止降级安装")
+        val installedCode = versionCodeOf(installed)
+        if (newCode < installedCode) {
+            return VerifyResult.Rejected(
+                "服务器上的版本（$newCode）低于当前版本（$installedCode），已阻止降级安装"
+            )
         }
 
         val installedDigest = signatureDigest(installed)
@@ -205,7 +277,27 @@ class UpdateManager(private val context: Context) {
         if (installedDigest != null && archiveDigest != null && !installedDigest.contentEquals(archiveDigest)) {
             return VerifyResult.SignatureMismatch("安装包签名与本机版本不一致，系统会拒绝覆盖安装")
         }
-        return VerifyResult.Passed
+        return VerifyResult.SelfUpdate(newName, newCode)
+    }
+
+    /** APK 文件头校验：ZIP 魔数 PK\003\004 */
+    private fun looksLikeZip(file: File): Boolean {
+        return try {
+            file.inputStream().use { input ->
+                val header = ByteArray(4)
+                if (input.read(header) != 4) return false
+                header[0] == 0x50.toByte() && header[1] == 0x4B.toByte() &&
+                    header[2] == 0x03.toByte() && header[3] == 0x04.toByte()
+            }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun installedInfo(packageName: String): PackageInfo? = try {
+        context.packageManager.getPackageInfo(packageName, packageFlags())
+    } catch (e: Exception) {
+        null
     }
 
     private fun packageFlags(): Int = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
