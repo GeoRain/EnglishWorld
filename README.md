@@ -95,6 +95,22 @@ cd EnglishWorld
 - 下载引导区域
 - 数据统计展示
 
+## 版本更新
+
+应用内「我的 → 连点版本号 9 次 → 安装本地 APK / 检查更新」走这条链路：
+
+1. **下载**：`UpdateManager` 按顺序尝试下载源，默认第一源是仓库 Release 的稳定附件
+   `https://github.com/GeoRain/EnglishWorld/releases/latest/download/JCCodeV3.apk`，
+   第二源是官网分发地址兜底；开发者页可临时覆盖。
+   以后发新版本，只需在新 Release 里挂**同名**附件 `JCCodeV3.apk`，客户端不用改代码。
+2. **校验**：ZIP 魔数 → 包可解析 → 降级拦截 → 同名应用签名比对。
+3. **安装**：`ApkInstaller` 先探测设备官方接口 `zybos_manager`（`ZybosBridge`），
+   可用则 `setInstallPackageDisallow(false)` → `silentInstallApk(path, true, pkg)` 静默安装并轮询验证；
+   被系统签名校验封禁或设备无此接口时，明确提示原因并改用系统安装器（用户确认）。
+
+当前分发的是 **JC Code V3 3.2.6**（包名 `JC.CODE.V3`，versionCode 97），
+与官网旧的 3.1.0 证书不同，覆盖安装前必须先卸载旧版。
+
 ## 技术栈
 
 - **语言**: Kotlin

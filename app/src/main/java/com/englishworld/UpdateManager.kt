@@ -24,8 +24,15 @@ class UpdateManager(private val context: Context) {
     companion object {
         private const val TAG = "UpdateManager"
 
-        /** 内置下载源，按顺序尝试 */
+        /**
+         * 内置下载源，按顺序尝试。
+         *
+         * 第一源是仓库 Release 上的稳定附件名（latest/download/JCCodeV3.apk）：
+         * 以后发新版本只要在新 Release 里挂同名附件，客户端无需改代码即可拿到最新包；
+         * 第二源是官网当前分发地址，作为兜底。
+         */
         private val DEFAULT_SOURCES = listOf(
+            "https://github.com/GeoRain/EnglishWorld/releases/latest/download/JCCodeV3.apk",
             "https://app.aibangos.xyz/therr.apk"
         )
 
